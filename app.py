@@ -109,7 +109,15 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK', 200
-
+def stop_loading_animation(chat_id):
+    """主動停止 LINE 的載入動畫"""
+    url = 'https://api.line.me/v2/bot/chat/loading/stop'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {os.getenv("CHANNEL_ACCESS_TOKEN")}'
+    }
+    data = {"chatId": chat_id}
+    requests.post(url, headers=headers, json=data)
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_msg = event.message.text
@@ -126,7 +134,7 @@ def handle_message(event):
         
         # 取得 AI 回覆
         answer = GPT_response(user_id, user_msg)
-        
+        stop_loading_animation(user_id)#停止動畫
         # 回傳
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=answer))
         
