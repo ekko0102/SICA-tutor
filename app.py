@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 import hashlib
 import threading
+import concurrent.futures  # 新增這行！
 
 app = Flask(__name__)
 
