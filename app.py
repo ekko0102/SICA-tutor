@@ -465,7 +465,61 @@ def handle_message(event):
     thread_pool.submit(process_in_background, user_id, user_msg, reply_token)
     
     print(f"✅ Message submitted to thread pool for {user_id[:8]}")
+# =============================================
+# 測試端點
+# =============================================
 
+@app.route("/test", methods=['GET', 'POST'])
+@app.route("/test-simple", methods=['GET', 'POST'])
+def test_simple():
+    """測試端點 - 用於壓力測試和功能驗證"""
+    try:
+        if request.method == 'GET':
+            return jsonify({
+                "status": "ready",
+                "endpoint": "/test-simple",
+                "description": "Test endpoint for LINE Bot",
+                "usage": "POST with JSON: {'user_id': 'test_user', 'message': 'Hello'}",
+                "timestamp": datetime.now().isoformat(),
+                "system": "LINE Bot with OpenAI Assistant"
+            }), 200
+        
+        # POST 請求：實際測試
+        data = request.json or {}
+        user_id = data.get('user_id', 'test_user_' + datetime.now().strftime("%H%M%S"))
+        message = data.get('message', 'Hello, this is a test message.')
+        
+        print(f"🎯 測試請求: 使用者 {user_id[:8]}, 訊息: {message[:50]}...")
+        
+        # 方法1：直接處理（同步）
+        start_time = time.time()
+        
+        # 直接呼叫 GPT_response_direct
+        response = GPT_response_direct(user_id, message)
+        
+        duration = time.time() - start_time
+        
+        print(f"✅ 測試完成: 耗時 {duration:.2f}秒, 回應長度: {len(response)}")
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "original_message": message,
+            "response": response[:2000],  # 限制長度
+            "response_length": len(response),
+            "duration_seconds": round(duration, 2),
+            "timestamp": datetime.now().isoformat(),
+            "note": "Direct processing (no queue)"
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ 測試端點錯誤: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 # =============================================
 # 管理端點
 # =============================================
