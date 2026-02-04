@@ -631,14 +631,55 @@ def GPT_response_direct(user_id, text):
             redis_db.delete(conv_key)
             redis_db.delete(f"t:{user_id}")
             print(f"Periodic cleanup for {user_id[:8]}")
-        
+        if DISK_ENABLED:
+            # 在背景執行硬碟儲存
+            threading.Thread(
+                target=save_to_disk_in_background,
+                args=(user_id,),
+                daemon=True
+            ).start()        
         return ai_reply
         
     except Exception as e:
         print(f"GPT_response error: {e}")
         # 返回中性回應，而不是錯誤訊息
         return "I'm currently processing your request. Please give me a moment to think."
-
+def save_to_disk_in_background(user_id):
+    """背景執行：儲存對話到硬碟"""
+    try:
+        # 等待一下，讓 Redis 有時間儲存
+        time.sleep(2)
+        
+        # 取得學生匿名 ID
+        student_id = generate_anonymous_id(user_id)
+        
+        # 從 Redis 取得完整的對話歷史
+        key = f"h:{student_id}"
+        messages_json = redis_db.lrange(key, 0, -1)
+        
+        # 轉換為標準格式
+        messages_list = []
+        for msg_json in messages_json:
+            try:
+                msg = json.loads(msg_json)
+                messages_list.append({
+                    "role": "user" if msg["r"] == "u" else "assistant",
+                    "content": msg["c"],
+                    "timestamp": msg["t"]
+                })
+            except:
+                continue
+        
+        # 儲存到硬碟
+        if messages_list:
+            success = disk_storage.save_student_conversation(student_id, messages_list)
+            if success:
+                print(f"💾 Disk save successful for {student_id[:8]} ({len(messages_list)} messages)")
+            else:
+                print(f"❌ Disk save failed for {student_id[:8]}")
+        
+    except Exception as e:
+        print(f"⚠️  Background disk save failed: {e}")
 def GPT_response(user_id, text):
     """新的 GPT_response，使用隊列處理"""
     try:
