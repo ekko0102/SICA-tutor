@@ -380,7 +380,44 @@ def export_conversations():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+@app.route("/test-openai", methods=['POST'])
+def test_openai():
+    """測試用的端點，確保真的呼叫 OpenAI"""
+    try:
+        data = request.json
+        user_id = data.get('user_id', 'test_user')
+        message = data.get('message', 'Hello, please give me a real response.')
+        
+        print(f"🔍 Test endpoint called by {user_id}: {message[:50]}")
+        
+        # 確保這是需要真實回應的測試
+        wait_for_real = data.get('wait_for_real_response', False)
+        
+        if wait_for_real:
+            print(f"⏳ Making real OpenAI call for {user_id}")
+            # 實際呼叫 GPT_response
+            response = GPT_response(user_id, message)
+            print(f"✅ OpenAI responded to {user_id}")
+        else:
+            # 快速測試模式
+            response = "Test response (quick mode)"
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "response": response[:500] if response else "",
+            "response_length": len(response) if response else 0,
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Test endpoint error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False, 
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 # --- 8. 啟動 ---
 if __name__ == "__main__":
     print(f"🚀 Starting with {MAX_WORKERS} workers, {MAX_CONCURRENT_REQUESTS} concurrent limit")
