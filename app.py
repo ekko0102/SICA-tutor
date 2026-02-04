@@ -717,9 +717,13 @@ def handle_message(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
 
+    print(f"📩 LINE Message received: {user_id} said: {user_msg[:50]}")
+
     # 防重複處理
     if redis_db.get(f"p:{msg_id}"):
+        print(f"⚠️  Duplicate message {msg_id}, skipping")
         return 
+    
     redis_db.setex(f"p:{msg_id}", 20, "1")
 
     # 群組過濾
@@ -728,19 +732,62 @@ def handle_message(event):
             redis_db.delete(f"p:{msg_id}")
             return
     
-    # 重要：不發送任何文字回覆，只啟動載入動畫
-    # 零失敗系統會自動啟動載入動畫
+    # 方法1：立即開始載入動畫（唯一的使用者回饋）
+    try:
+        send_loading(user_id)
+        print(f"▶️ Started loading animation for {user_id}")
+    except Exception as e:
+        print(f"⚠️  Failed to start loading: {e}")
+        # 如果載入動畫失敗，還是繼續處理，但不顯示動畫
     
-    # 立即提交任務到零失敗系統
-    print(f"🎯 Submitting message from {user_id[:8]}: {user_msg[:50]}...")
+    # 方法2：使用直接處理（繞過可能有問題的隊列）
+    def process_and_respond():
+        try:
+            print(f"🔧 Starting direct processing for {user_id}")
+            
+            # 直接呼叫 GPT
+            response = GPT_response_direct(user_id, user_msg)
+            
+            print(f"✅ GPT response received for {user_id}")
+            
+            # 停止載入動畫
+            try:
+                stop_loading(user_id)
+                print(f"⏹️ Stopped loading animation for {user_id}")
+            except:
+                pass
+            
+            # 發送回應（只發送 AI 的回應，沒有其他文字）
+            if len(response) > 3000:
+                response = response[:3000] + "\n\n[訊息已截斷]"
+            
+            try:
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=response)
+                )
+                print(f"📤 Sent AI response to {user_id}")
+            except Exception as e:
+                print(f"❌ Failed to send AI response: {e}")
+                
+        except Exception as e:
+            print(f"❌ Processing failed: {e}")
+            traceback.print_exc()
+            
+            # 停止載入動畫
+            try:
+                stop_loading(user_id)
+            except:
+                pass
+            
+            # 重要：即使失敗也不發送錯誤訊息給使用者
+            # 只在後台記錄錯誤
     
-    # 使用零失敗系統處理
-    task_id = zero_failure_system.submit_task(user_id, user_msg, reply_token)
+    # 啟動背景執行緒
+    thread = threading.Thread(target=process_and_respond, daemon=True)
+    thread.start()
     
-    print(f"✅ Task {task_id[:8]} submitted to zero-failure system for {user_id[:8]}")
-    
-    # 注意：這裡不發送任何文字回覆，只有載入動畫
-    # 所有回應將由零失敗系統透過 push_message 發送
+    print(f"✅ Message processing started for {user_id}")
 
 # =============================================
 # 管理端點 - 增強版本
