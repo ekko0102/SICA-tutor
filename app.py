@@ -16,12 +16,54 @@ import concurrent.futures
 
 app = Flask(__name__)
 
+# 隊列系統
+class OpenAIBatchProcessor:
+    """批量處理 OpenAI 請求，避免超載"""
+    def __init__(self, max_concurrent=3):
+        self.max_concurrent = max_concurrent
+        self.semaphore = threading.Semaphore(max_concurrent)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent)
+        self.request_count = 0
+        
+    def process(self, user_id, text):
+        """處理單一請求"""
+        self.request_count += 1
+        req_num = self.request_count
+        
+        print(f"[{req_num}] Request from {user_id[:8]} waiting for semaphore...")
+        
+        # 取得許可（如果超過併發限制會等待）
+        acquired = self.semaphore.acquire(blocking=False)
+        if not acquired:
+            print(f"[{req_num}] Queue full, waiting...")
+            # 等待直到有位置
+            self.semaphore.acquire(blocking=True)
+        
+        try:
+            print(f"[{req_num}] Processing for {user_id[:8]}...")
+            
+            # 這裡呼叫您現有的 GPT_response 函數
+            result = self._call_gpt_response(user_id, text)
+            return result
+            
+        finally:
+            # 釋放許可
+            self.semaphore.release()
+            print(f"[{req_num}] Completed for {user_id[:8]}")
+    
+    def _call_gpt_response(self, user_id, text):
+        """呼叫現有的 GPT_response 函數"""
+        return GPT_response_direct(user_id, text)
+
+# 建立全域處理器
+openai_processor = OpenAIBatchProcessor(max_concurrent=3)
+
 # --- 1. 初始化設定 ---
 redis_url = os.getenv('REDIS_URL')
 if not redis_url:
     raise ValueError("REDIS_URL is not set")
 redis_db = redis.StrictRedis.from_url(redis_url, decode_responses=True,
-                                     max_connections=10)  # 限制連接數
+                                     max_connections=10)
 
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
@@ -30,16 +72,16 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY is not set")
 
-client = openai.OpenAI(api_key=openai_api_key, timeout=25.0)  # 減少timeout
+client = openai.OpenAI(api_key=openai_api_key, timeout=25.0)
 ASSISTANT_ID = os.getenv('ASSISTANT_ID') 
 
-# --- 2. 根據硬體優化設定 ---
-MAX_THREAD_MESSAGES = 15          # 適當增加對話記憶
-MAX_MESSAGE_LENGTH = 2000         # 限制單條訊息長度
-MAX_CONCURRENT_REQUESTS = 4       # 減少併發數（0.5 CPU）
-MAX_WORKERS = 3                   # 背景執行緒數
-REQUEST_TIMEOUT = 12              # 請求超時時間
-REDIS_MAX_PER_STUDENT = 80        # 每生最大訊息數
+# --- 2. 優化設定 ---
+MAX_THREAD_MESSAGES = 15
+MAX_MESSAGE_LENGTH = 2000
+MAX_CONCURRENT_REQUESTS = 4
+MAX_WORKERS = 3
+REQUEST_TIMEOUT = 12
+REDIS_MAX_PER_STUDENT = 80
 
 # --- 3. 資源監控 ---
 class ResourceMonitor:
@@ -65,13 +107,13 @@ monitor = ResourceMonitor()
 
 # --- 4. 優化資料儲存 ---
 def generate_anonymous_id(user_id):
-    return hashlib.md5(user_id.encode()).hexdigest()[:10]  # 更短ID
+    return hashlib.md5(user_id.encode()).hexdigest()[:10]
 
 def save_message_optimized(user_id, role, content):
     """節省記憶體的儲存方式"""
     try:
         student_id = generate_anonymous_id(user_id)
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")  # 更緊湊時間格式
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         
         # 壓縮內容
         if len(content) > MAX_MESSAGE_LENGTH:
@@ -99,37 +141,34 @@ def save_message_optimized(user_id, role, content):
         print(f"Save optimized error: {e}")
         return False
 
-# --- 5. GPT_response 函數（資源感知）---
-def GPT_response(user_id, text):
-    """資源感知的 AI 回應函數"""
+# --- 5. GPT_response 函數 ---
+def GPT_response_direct(user_id, text):
+    """直接呼叫 OpenAI 的版本"""
     monitor.increment()
     
     try:
-        # 檢查資源使用（簡化版）
+        # 檢查資源使用
         if monitor.get_stats()["requests_per_minute"] > 30:
             return "System is busy. Please wait a moment and try again."
         
         # 儲存使用者訊息
-        save_message_optimized(user_id, "user", text[:1500])  # 進一步限制輸入長度
+        save_message_optimized(user_id, "user", text[:1500])
         
         # 取得或創建 thread
-        thread_id = redis_db.get(f"t:{user_id}")  # 更短的鍵名
+        thread_id = redis_db.get(f"t:{user_id}")
         
         # 智能清理 thread
         if thread_id:
             try:
-                # 快速檢查訊息數量
                 messages = client.beta.threads.messages.list(
                     thread_id=thread_id,
                     limit=MAX_THREAD_MESSAGES + 2,
                     timeout=2.0
                 )
                 
-                # 如果超過限制，清理到保留8條
                 if len(messages.data) > MAX_THREAD_MESSAGES:
                     print(f"Cleaning thread ({len(messages.data)} -> 8)")
                     
-                    # 只保留最近8條
                     keep_messages = []
                     for msg in messages.data[-8:]:
                         if hasattr(msg, 'content') and msg.content:
@@ -146,7 +185,7 @@ def GPT_response(user_id, text):
                             messages=keep_messages
                         )
                         thread_id = new_thread.id
-                        redis_db.setex(f"t:{user_id}", 2400, thread_id)  # 40分鐘
+                        redis_db.setex(f"t:{user_id}", 2400, thread_id)
                     else:
                         thread_id = None
                         
@@ -171,14 +210,14 @@ def GPT_response(user_id, text):
                 timeout=2.0
             )
         
-        # 執行助理（較短timeout）
+        # 執行助理
         run = client.beta.threads.runs.create(
             thread_id=thread_id, 
             assistant_id=ASSISTANT_ID,
             timeout=6.0
         )
         
-        # 等待完成（最多10秒）
+        # 等待完成
         start = time.time()
         while run.status != "completed":
             if time.time() - start > REQUEST_TIMEOUT:
@@ -189,7 +228,7 @@ def GPT_response(user_id, text):
                 print(f"Run failed: {error_msg}")
                 break
             
-            time.sleep(0.6)  # 減少檢查頻率
+            time.sleep(0.6)
             run = client.beta.threads.runs.retrieve(
                 thread_id=thread_id, 
                 run_id=run.id,
@@ -209,15 +248,15 @@ def GPT_response(user_id, text):
             
         ai_reply = messages.data[0].content[0].text.value
         
-        # 儲存回覆（限制長度）
+        # 儲存回覆
         save_message_optimized(user_id, "assistant", ai_reply[:2000])
         
-        # 定期清理計數器
+        # 定期清理
         conv_key = f"c:{user_id}"
         conv_count = redis_db.incr(conv_key)
         redis_db.expire(conv_key, 1800)
         
-        if conv_count >= 6:  # 每6次對話清理
+        if conv_count >= 6:
             redis_db.delete(conv_key)
             redis_db.delete(f"t:{user_id}")
             print(f"Periodic cleanup for {user_id[:8]}")
@@ -231,7 +270,22 @@ def GPT_response(user_id, text):
         print(f"GPT_response error: {e}")
         return "System error. Please try again."
 
-# --- 6. LINE 處理（保持不變但優化）---
+def GPT_response(user_id, text):
+    """新的 GPT_response，使用隊列處理"""
+    try:
+        print(f"📨 Received request from {user_id[:8]}: {text[:30]}...")
+        
+        # 使用批處理器
+        result = openai_processor.process(user_id, text)
+        
+        print(f"✅ Response ready for {user_id[:8]}")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error in queued GPT_response: {e}")
+        return f"Processing error: {str(e)[:100]}"
+
+# --- 6. LINE 處理 ---
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 def send_loading(chat_id):
@@ -310,8 +364,50 @@ def handle_message(event):
             redis_db.delete(f"p:{msg_id}")
             return
     
-    # 提交背景處理
-    executor.submit(process_background, user_id, user_msg, reply_token)
+    # 立即回覆（避免 LINE 超時）
+    try:
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text="I received your question! Processing now...")
+        )
+    except:
+        pass
+    
+    # 顯示動畫
+    send_loading(user_id)
+    
+    # 使用執行緒處理
+    def process_in_thread():
+        try:
+            # 使用新的 GPT_response（會自動排隊）
+            answer = GPT_response(user_id, user_msg)
+            
+            # 停止動畫
+            stop_loading(user_id)
+            
+            # 檢查長度
+            if len(answer) > 3000:
+                answer = answer[:3000] + "\n\n[Message trimmed]"
+            
+            # 使用 push_message（reply_token 可能已過期）
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text=answer)
+            )
+            
+            print(f"📤 Sent reply to {user_id[:8]}")
+            
+        except Exception as e:
+            print(f"Error in process_in_thread: {e}")
+            try:
+                stop_loading(user_id)
+            except:
+                pass
+    
+    # 啟動背景執行緒
+    thread = threading.Thread(target=process_in_thread)
+    thread.daemon = True
+    thread.start()
 
 # --- 7. 管理端點 ---
 @app.route("/health", methods=['GET'])
@@ -330,6 +426,38 @@ def health_check():
         }), 200
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route("/processor-stats", methods=['GET'])
+def processor_stats():
+    """查看處理器狀態"""
+    stats = {
+        "max_concurrent": openai_processor.max_concurrent,
+        "total_requests": openai_processor.request_count,
+        "current_semaphore_value": openai_processor.semaphore._value,
+        "active_requests": openai_processor.max_concurrent - openai_processor.semaphore._value,
+        "timestamp": datetime.now().isoformat()
+    }
+    return jsonify(stats)
+
+@app.route("/processor-config", methods=['POST'])
+def update_processor_config():
+    """調整處理器設定"""
+    secret = request.args.get('secret')
+    if secret != os.getenv('EXPORT_SECRET', 'default123'):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.json or {}
+    new_max = data.get('max_concurrent', 3)
+    
+    # 更新全域處理器
+    global openai_processor
+    openai_processor = OpenAIBatchProcessor(max_concurrent=new_max)
+    
+    return jsonify({
+        "status": "updated",
+        "new_max_concurrent": new_max,
+        "message": f"Processor reconfigured to {new_max} concurrent requests"
+    })
 
 @app.route("/export/conversations", methods=['GET'])
 def export_conversations():
@@ -352,7 +480,6 @@ def export_conversations():
                 for msg_json in messages:
                     try:
                         msg = json.loads(msg_json)
-                        # 還原格式
                         student_msgs.append({
                             "student_id": msg["s"],
                             "role": "user" if msg["r"] == "u" else "assistant",
@@ -380,6 +507,7 @@ def export_conversations():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 @app.route("/test-openai", methods=['POST'])
 def test_openai():
     """測試用的端點，確保真的呼叫 OpenAI"""
@@ -418,10 +546,58 @@ def test_openai():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }), 500
+
+@app.route("/test-simple", methods=['POST', 'GET'])
+def test_simple():
+    """極簡測試端點"""
+    try:
+        print("✅ /test-simple endpoint called")
+        
+        if request.method == 'GET':
+            return jsonify({
+                "status": "ready",
+                "endpoint": "/test-simple",
+                "message": "Use POST to test OpenAI"
+            }), 200
+        
+        # POST 請求：實際測試 OpenAI
+        data = request.json or {}
+        user_id = data.get('user_id', 'test_user_001')
+        message = data.get('message', 'Hello, please respond.')
+        
+        print(f"🎯 Testing OpenAI for user: {user_id}")
+        print(f"📝 Message: {message}")
+        
+        # 直接呼叫 GPT_response（同步，確保執行）
+        start_time = time.time()
+        response_text = GPT_response(user_id, message)
+        duration = time.time() - start_time
+        
+        print(f"✅ OpenAI response received in {duration:.1f}s")
+        print(f"📄 Response: {response_text[:100]}...")
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "response": response_text[:1000],
+            "response_length": len(response_text),
+            "duration_seconds": round(duration, 2),
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error in /test-simple: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
 # --- 8. 啟動 ---
 if __name__ == "__main__":
-    print(f"🚀 Starting with {MAX_WORKERS} workers, {MAX_CONCURRENT_REQUESTS} concurrent limit")
-    print(f"💾 Memory optimized: {MAX_THREAD_MESSAGES} messages per thread")
+    print(f"🚀 Starting with {MAX_WORKERS} workers")
+    print(f"🔧 OpenAI queue configured for {openai_processor.max_concurrent} concurrent requests")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, threaded=True)
