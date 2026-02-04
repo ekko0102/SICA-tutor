@@ -781,38 +781,95 @@ def handle_message(event):
         print(f"⚠️  Failed to start loading: {e}")
         # 如果載入動畫失敗，還是繼續處理，但不顯示動畫
     
-    # 方法2：使用直接處理（繞過可能有問題的隊列）
-    def process_and_respond():
+    #使用直接處理（繞過可能有問題的隊列）
+    # def process_and_respond():
+    #     try:
+    #         print(f"🔧 Starting direct processing for {user_id}")
+            
+    #         # 直接呼叫 GPT
+    #         response = GPT_response_direct(user_id, user_msg)
+            
+    #         print(f"✅ GPT response received for {user_id}")
+            
+    #         # 停止載入動畫
+    #         try:
+    #             stop_loading(user_id)
+    #             print(f"⏹️ Stopped loading animation for {user_id}")
+    #         except:
+    #             pass
+            
+    #         # 發送回應（只發送 AI 的回應，沒有其他文字）
+    #         if len(response) > 3000:
+    #             response = response[:3000] + "\n\n[訊息已截斷]"
+            
+    #         try:
+    #             line_bot_api.push_message(
+    #                 user_id,
+    #                 TextSendMessage(text=response)
+    #             )
+    #             print(f"📤 Sent AI response to {user_id}")
+    #         except Exception as e:
+    #             print(f"❌ Failed to send AI response: {e}")
+                
+    #     except Exception as e:
+    #         print(f"❌ Processing failed: {e}")
+    #         traceback.print_exc()
+            
+    #         # 停止載入動畫
+    #         try:
+    #             stop_loading(user_id)
+    #         except:
+    #             pass
+            
+            # 重要：即使失敗也不發送錯誤訊息給使用者
+            # 只在後台記錄錯誤
+    # ✅ 改為使用零失敗系統處理
+    def process_with_zero_failure():
         try:
-            print(f"🔧 Starting direct processing for {user_id}")
+            print(f"🔧 Submitting to zero-failure system for {user_id}")
             
-            # 直接呼叫 GPT
-            response = GPT_response_direct(user_id, user_msg)
+            # 提交任務到零失敗系統
+            task_id = zero_failure_system.submit_task(user_id, user_msg, reply_token)
             
-            print(f"✅ GPT response received for {user_id}")
+            # 等待任務完成
+            start_time = time.time()
+            max_wait = 60  # 最多等待60秒
             
-            # 停止載入動畫
-            try:
-                stop_loading(user_id)
-                print(f"⏹️ Stopped loading animation for {user_id}")
-            except:
-                pass
+            while time.time() - start_time < max_wait:
+                if task_id in zero_failure_system.completed_tasks:
+                    print(f"✅ Task completed via zero-failure system for {user_id}")
+                    
+                    # 停止載入動畫
+                    try:
+                        stop_loading(user_id)
+                        print(f"⏹️ Stopped loading animation for {user_id}")
+                    except:
+                        pass
+                    
+                    # 任務已經由零失敗系統發送回應
+                    return
+                
+                time.sleep(1)
             
-            # 發送回應（只發送 AI 的回應，沒有其他文字）
-            if len(response) > 3000:
-                response = response[:3000] + "\n\n[訊息已截斷]"
+            print(f"⏰ Timeout waiting for zero-failure system for {user_id}")
             
+            # 如果超時，發送一個安慰訊息
             try:
                 line_bot_api.push_message(
                     user_id,
-                    TextSendMessage(text=response)
+                    TextSendMessage(text="您的請求正在處理中，請稍候...")
                 )
-                print(f"📤 Sent AI response to {user_id}")
-            except Exception as e:
-                print(f"❌ Failed to send AI response: {e}")
+            except:
+                pass
+                
+            # 停止載入動畫
+            try:
+                stop_loading(user_id)
+            except:
+                pass
                 
         except Exception as e:
-            print(f"❌ Processing failed: {e}")
+            print(f"❌ Zero-failure processing failed: {e}")
             traceback.print_exc()
             
             # 停止載入動畫
@@ -820,10 +877,6 @@ def handle_message(event):
                 stop_loading(user_id)
             except:
                 pass
-            
-            # 重要：即使失敗也不發送錯誤訊息給使用者
-            # 只在後台記錄錯誤
-    
     # 啟動背景執行緒
     thread = threading.Thread(target=process_and_respond, daemon=True)
     thread.start()
