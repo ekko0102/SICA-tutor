@@ -15,6 +15,7 @@ import threading
 import concurrent.futures
 import uuid
 import queue
+from disk_config import disk
 from collections import defaultdict
 
 app = Flask(__name__)
@@ -890,17 +891,17 @@ def test_simple():
 if __name__ == "__main__":
     print(f"""
     ========================================
-    🚀 ZERO-FAILURE LINE BOT STARTING
+    🚀 SICA TUTOR STARTING
     ========================================
-    Features:
-    ✅ Zero-failure guaranteed response system
-    ✅ Auto-managed loading animations
-    ✅ No error messages to users
-    ✅ Infinite retry until success
-    ✅ Queue size: Unlimited
-    ✅ Max workers: {zero_failure_system.max_workers}
+    📁 Disk mounted at: {disk.mount_path}
+    💾 Disk size: 5 GB
+    📊 Storage initialized
     
-    OpenAI queue configured for {openai_processor.max_concurrent} concurrent requests
+    API Endpoints:
+    - /health                    : 健康檢查
+    - /storage/stats             : 儲存狀態
+    - /storage/backup            : 建立備份
+    - /export/conversations      : 匯出對話
     ========================================
     """)
     
