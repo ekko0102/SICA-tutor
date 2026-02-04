@@ -1,8 +1,8 @@
-# requirements.txt
+# requirements.txt - 修正版本
 Flask==2.3.3
 line-bot-sdk==3.22.0
 openai==1.3.0
 redis==5.0.0
-requests==2.31.0
+requests==2.32.3  # 配合 line-bot-sdk 的要求
 gunicorn==21.2.0
 schedule==1.2.0
