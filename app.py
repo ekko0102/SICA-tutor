@@ -520,6 +520,76 @@ def test_simple():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }), 500
+@app.route("/test/async", methods=['POST'])
+def test_async():
+    """非同步測試端點（使用隊列）"""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id', 'async_test_user_' + datetime.now().strftime("%H%M%S"))
+        message = data.get('message', 'Async test message')
+        
+        print(f"🎯 非同步測試請求: 使用者 {user_id[:8]}")
+        
+        # 提交到執行緒池
+        thread_pool.submit(process_in_background, user_id, message, None)
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "message": "Request submitted to background processing",
+            "note": "Response will be sent via LINE push message",
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/test/health", methods=['GET'])
+def test_health():
+    """詳細健康檢查"""
+    try:
+        # 檢查 Redis
+        redis_ok = False
+        try:
+            redis_db.ping()
+            redis_ok = True
+        except:
+            redis_ok = False
+        
+        # 檢查 OpenAI
+        openai_ok = False
+        try:
+            # 簡單的測試，創建一個空的 thread
+            test_thread = client.beta.threads.create()
+            openai_ok = True
+        except:
+            openai_ok = False
+        
+        # 系統統計
+        stats = monitor.get_stats()
+        
+        return jsonify({
+            "status": "healthy" if redis_ok and openai_ok else "degraded",
+            "checks": {
+                "redis": redis_ok,
+                "openai": openai_ok,
+                "disk_storage": DISK_ENABLED,
+                "line_api": bool(os.getenv('CHANNEL_ACCESS_TOKEN'))
+            },
+            "resources": stats,
+            "thread_pool": {
+                "max_workers": thread_pool._max_workers,
+                "active_requests": len([t for t in threading.enumerate() if "ThreadPool" in t.name])
+            },
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 # =============================================
 # 管理端點
 # =============================================
