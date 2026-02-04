@@ -1,4 +1,4 @@
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort, jsonify, make_response, send_file
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import *
@@ -13,9 +13,8 @@ from datetime import datetime
 import hashlib
 import threading
 import concurrent.futures
-import uuid
-import queue
-from collections import defaultdict
+
+# 硬碟儲存設定
 try:
     from disk_config import disk_storage
     DISK_ENABLED = True
@@ -27,382 +26,7 @@ except Exception as e:
     DISK_ENABLED = False
     print(f"⚠️  Disk storage disabled (other error): {e}")
 
-
 app = Flask(__name__)
-
-# =============================================
-# 零失敗保證系統
-# =============================================
-class GuaranteedResponseSystem:
-    """保證回應系統 - 永不失敗，持續重試直到成功"""
-    
-    def __init__(self, max_workers=5):
-        self.pending_queue = queue.Queue()
-        self.processing_tasks = {}
-        self.completed_tasks = {}
-        self.task_status = {}
-        self.max_workers = max_workers
-        self.loading_sessions = {}
-        self.lock = threading.Lock()
-        self.workers = []  # 新增：儲存 worker 參考
-        self.is_running = True  # 新增：運行標記
-        
-        print(f"🛠️  Initializing {max_workers} workers...")
-        
-        # 啟動工作者執行緒
-        for i in range(max_workers):
-            worker = threading.Thread(
-                target=self._worker_loop,
-                args=(i,),
-                daemon=True,
-                name=f"Worker-{i}"
-            )
-            worker.start()
-            self.workers.append(worker)
-            print(f"✅ Worker {i} started (ID: {worker.ident})")
-        
-        # 啟動監控執行緒
-        monitor = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True,
-            name="Task-Monitor"
-        )
-        monitor.start()
-        
-        # 啟動載入動畫管理執行緒
-        loading_manager = threading.Thread(
-            target=self._loading_manager_loop,
-            daemon=True,
-            name="Loading-Manager"
-        )
-        loading_manager.start()
-        
-        print(f"🚀 All {max_workers} workers initialized and ready")
-    
-    def _worker_loop(self, worker_id):
-        """工作者執行緒 - 永不停止，持續處理任務"""
-        print(f"👷 Worker {worker_id} loop STARTED")
-        
-        while self.is_running:
-            try:
-                # print(f"⏳ Worker {worker_id} waiting for task...")
-
-                # 從隊列獲取任務（阻塞等待，timeout=1秒以便檢查運行狀態）
-                try:
-                    task_data = self.pending_queue.get(timeout=1)
-                except queue.Empty:
-                    continue  # 如果隊列空，繼續等待
-                
-                if task_data is None:  # 停止信號
-                    break
-                
-                task_id, task = task_data
-                
-                print(f"👷 Worker {worker_id} START processing task {task_id[:8]} "
-                      f"for {task['user_id'][:8]}")
-                
-                # 處理任務（無限重試直到成功）
-                self._process_with_infinite_retry(worker_id, task_id, task)
-                
-                # 標記隊列完成
-                self.pending_queue.task_done()
-                
-                print(f"👷 Worker {worker_id} FINISHED task {task_id[:8]}")
-                
-            except Exception as e:
-                print(f"❌ Worker {worker_id} loop error: {str(e)[:100]}")
-                traceback.print_exc()
-                time.sleep(5)  # 錯誤後休息5秒
-        
-        print(f"👷 Worker {worker_id} loop STOPPED")
-    
-    def _process_with_infinite_retry(self, worker_id, task_id, task):
-        """無限重試直到成功"""
-        user_id = task['user_id']
-        text = task['text']
-        reply_token = task.get('reply_token')
-        
-        max_retries = 20  # 最多重試次數（實際上會一直重試）
-        backoff_base = 5   # 退避基礎時間
-        
-        for attempt in range(max_retries + 100):  # 實際上會一直嘗試
-            try:
-                # 更新重試次數
-                with self.lock:
-                    if task_id in self.task_status:
-                        self.task_status[task_id]['retry_count'] = attempt
-                        self.task_status[task_id]['last_attempt'] = datetime.now().isoformat()
-                
-                print(f"🔄 Worker {worker_id} attempt {attempt+1} for task {task_id[:8]}")
-                
-                # 發送進度更新（每3次重試更新一次）
-                if attempt % 3 == 0:
-                    self._send_progress_update(
-                        user_id, 
-                        f"🤖 AI is thinking... (attempt {attempt+1})"
-                    )
-                
-                # 嘗試獲取AI回應
-                response = self._call_gpt_with_patience(user_id, text, attempt)
-                
-                if response and len(response.strip()) > 5:  # 有效回應
-                    print(f"✅ Task {task_id[:8]} completed after {attempt+1} attempts")
-                    
-                    # 儲存結果
-                    with self.lock:
-                        self.completed_tasks[task_id] = {
-                            'response': response,
-                            'completed_at': datetime.now().isoformat(),
-                            'attempts': attempt + 1,
-                            'user_id': user_id
-                        }
-                        if task_id in self.processing_tasks:
-                            del self.processing_tasks[task_id]
-                        self.task_status[task_id] = {
-                            'status': 'completed',
-                            'completed_at': datetime.now().isoformat()
-                        }
-                    
-                    # 發送最終回應
-                    success = self._deliver_final_response(user_id, response, reply_token)
-                    
-                    if success:
-                        # 停止載入動畫
-                        self._stop_loading_animation(user_id)
-                        return True
-                    else:
-                        print(f"⚠️ Delivery failed for task {task_id[:8]}, will retry...")
-                
-                # 如果失敗，等待後重試
-                wait_time = min(backoff_base * (1.5 ** attempt), 300)  # 指數退避，最大5分鐘
-                print(f"⏳ Waiting {wait_time:.1f}s before retry {attempt+2} for task {task_id[:8]}")
-                time.sleep(wait_time)
-                
-            except Exception as e:
-                print(f"❌ Attempt {attempt+1} failed: {str(e)[:100]}")
-                time.sleep(min(30, 5 * (attempt + 1)))  # 錯誤等待
-    
-    def _call_gpt_with_patience(self, user_id, text, attempt):
-        """有耐心地呼叫GPT，適應性超時"""
-        try:
-            # 根據嘗試次數調整超時
-            timeout = min(60, 10 + attempt * 5)  # 逐漸增加超時
-            
-            # 使用您的現有GPT_response函數
-            return GPT_response_direct(user_id, text)
-            
-        except Exception as e:
-            print(f"GPT call failed: {e}")
-            return None
-    
-    def _send_progress_update(self, user_id, message):
-        """發送進度更新（使用push_message）"""
-        try:
-            # 只發送重要更新，避免騷擾
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(text=message)
-            )
-            return True
-        except Exception as e:
-            print(f"Progress update failed: {e}")
-            return False
-    
-    def _deliver_final_response(self, user_id, response, reply_token=None):
-        """發送最終回應"""
-        try:
-            # 確保回應不會太長
-            if len(response) > 3000:
-                response = response[:3000] + "\n\n[訊息已截斷]"
-            
-            # 嘗試使用reply_token（如果還有效）
-            if reply_token:
-                try:
-                    line_bot_api.reply_message(
-                        reply_token,
-                        TextSendMessage(text=response)
-                    )
-                    return True
-                except:
-                    pass  # reply_token可能已過期
-            
-            # 使用push_message作為備用
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(text=response)
-            )
-            return True
-            
-        except Exception as e:
-            print(f"Final delivery failed: {e}")
-            return False
-    
-    def _start_loading_animation(self, user_id):
-        """開始載入動畫"""
-        try:
-            with self.lock:
-                if user_id not in self.loading_sessions:
-                    send_loading(user_id)
-                    self.loading_sessions[user_id] = {
-                        'started_at': time.time(),
-                        'last_restart': time.time()
-                    }
-        except Exception as e:
-            print(f"Failed to start loading: {e}")
-    
-    def _stop_loading_animation(self, user_id):
-        """停止載入動畫"""
-        try:
-            with self.lock:
-                if user_id in self.loading_sessions:
-                    stop_loading(user_id)
-                    del self.loading_sessions[user_id]
-        except Exception as e:
-            print(f"Failed to stop loading: {e}")
-    
-    def _loading_manager_loop(self):
-        """管理載入動畫，定期重啟避免超時"""
-        while True:
-            try:
-                time.sleep(5)  # 每5秒檢查一次
-                
-                with self.lock:
-                    current_time = time.time()
-                    users_to_restart = []
-                    
-                    for user_id, session in list(self.loading_sessions.items()):
-                        # 如果載入動畫超過8秒，需要重啟（LINE限制10秒）
-                        if current_time - session['last_restart'] > 8:
-                            users_to_restart.append(user_id)
-                    
-                    # 重啟載入動畫
-                    for user_id in users_to_restart:
-                        try:
-                            # 先停止
-                            stop_loading(user_id)
-                            time.sleep(0.5)
-                            # 再開始
-                            send_loading(user_id)
-                            self.loading_sessions[user_id]['last_restart'] = current_time
-                            print(f"🔄 Restarted loading animation for {user_id[:8]}")
-                        except:
-                            pass
-                            
-            except Exception as e:
-                print(f"Loading manager error: {e}")
-                time.sleep(10)
-    
-    def _monitor_loop(self):
-        """監控循環，檢查停滯的任務"""
-        while True:
-            try:
-                time.sleep(30)  # 每30秒檢查一次
-                
-                with self.lock:
-                    current_time = time.time()
-                    stale_tasks = []
-                    
-                    for task_id, status in list(self.task_status.items()):
-                        if status.get('status') == 'processing':
-                            # 檢查任務是否處理超過10分鐘
-                            started_str = status.get('started_at')
-                            if started_str:
-                                try:
-                                    started = datetime.fromisoformat(started_str)
-                                    age = (datetime.now() - started).total_seconds()
-                                    
-                                    if age > 600:  # 10分鐘
-                                        stale_tasks.append(task_id)
-                                except:
-                                    pass
-                    
-                    # 重啟停滯的任務
-                    for task_id in stale_tasks:
-                        print(f"⚠️ Restarting stale task {task_id[:8]}")
-                        if task_id in self.processing_tasks:
-                            task = self.processing_tasks[task_id]
-                            # 重新加入隊列
-                            self.submit_task(task['user_id'], task['text'], task.get('reply_token'))
-                            
-            except Exception as e:
-                print(f"Monitor error: {e}")
-    
-    def submit_task(self, user_id, text, reply_token=None):
-        """提交新任務到零失敗系統"""
-        task_id = str(uuid.uuid4())[:12]
-        
-        task = {
-            'task_id': task_id,
-            'user_id': user_id,
-            'text': text,
-            'reply_token': reply_token,
-            'submitted_at': datetime.now().isoformat()
-        }
-        
-        # 加入隊列
-        self.pending_queue.put((task_id, task))
-        
-        # 立即開始載入動畫
-        self._start_loading_animation(user_id)
-        
-        print(f"📥 Task {task_id[:8]} submitted for {user_id[:8]}, "
-              f"queue size: {self.pending_queue.qsize()}")
-        
-        return task_id
-    
-    def get_stats(self):
-        """獲取系統統計"""
-        with self.lock:
-            return {
-                'queue_size': self.pending_queue.qsize(),
-                'processing_tasks': len(self.processing_tasks),
-                'completed_tasks': len(self.completed_tasks),
-                'loading_sessions': len(self.loading_sessions),
-                'timestamp': datetime.now().isoformat()
-            }
-
-# 建立零失敗系統實例
-zero_failure_system = GuaranteedResponseSystem(max_workers=5)
-
-# =============================================
-# 原有隊列系統（保留但改為使用零失敗系統）
-# =============================================
-
-class OpenAIBatchProcessor:
-    """批量處理 OpenAI 請求，避免超載"""
-    def __init__(self, max_concurrent=5):
-        self.max_concurrent = max_concurrent
-        self.semaphore = threading.Semaphore(max_concurrent)
-        self.request_count = 0
-        
-    def process(self, user_id, text):
-        """處理單一請求 - 現在直接使用零失敗系統"""
-        self.request_count += 1
-        req_num = self.request_count
-        
-        print(f"[{req_num}] Request from {user_id[:8]} via batch processor")
-        
-        # 直接提交到零失敗系統
-        task_id = zero_failure_system.submit_task(user_id, text)
-        
-        # 等待任務完成（最多等待一段時間）
-        start_time = time.time()
-        max_wait = 300  # 最多等待5分鐘
-        
-        while time.time() - start_time < max_wait:
-            # 檢查任務是否已完成
-            if task_id in zero_failure_system.completed_tasks:
-                result = zero_failure_system.completed_tasks[task_id]['response']
-                print(f"[{req_num}] Task {task_id[:8]} completed via zero-failure system")
-                return result
-            
-            time.sleep(1)
-        
-        # 如果超時，返回等待訊息
-        return "Your request is still processing. You'll receive the answer soon!"
-
-# 建立全域處理器
-openai_processor = OpenAIBatchProcessor(max_concurrent=5)
 
 # =============================================
 # 初始化設定
@@ -412,7 +36,7 @@ redis_url = os.getenv('REDIS_URL')
 if not redis_url:
     raise ValueError("REDIS_URL is not set")
 redis_db = redis.StrictRedis.from_url(redis_url, decode_responses=True,
-                                     max_connections=20)  # 增加連接數
+                                     max_connections=20)
 
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
@@ -421,18 +45,16 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY is not set")
 
-# 改為：
+# 初始化 OpenAI 客戶端
 try:
-    # 簡化初始化，避免參數問題
     client = openai.OpenAI(api_key=openai_api_key)
 except Exception as e:
     print(f"❌ OpenAI client initialization failed: {e}")
-    # 如果初始化失敗，建立一個簡單的 client
     class SimpleOpenAIClient:
         def __init__(self, api_key):
             self.api_key = api_key
-    
     client = SimpleOpenAIClient(api_key=openai_api_key)
+
 ASSISTANT_ID = os.getenv('ASSISTANT_ID') 
 
 # =============================================
@@ -441,10 +63,82 @@ ASSISTANT_ID = os.getenv('ASSISTANT_ID')
 
 MAX_THREAD_MESSAGES = 15
 MAX_MESSAGE_LENGTH = 2000
-MAX_CONCURRENT_REQUESTS = 5
-MAX_WORKERS = 3
-REQUEST_TIMEOUT = 60  # 增加到60秒，讓AI有更多時間
 REDIS_MAX_PER_STUDENT = 80
+
+# =============================================
+# 簡單隊列系統（使用 ThreadPoolExecutor）
+# =============================================
+
+# 全域執行緒池（控制最大並發數）
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+def process_in_background(user_id, text, reply_token=None):
+    """背景處理訊息的函數"""
+    try:
+        print(f"🤖 Background processing for {user_id[:8]}")
+        
+        # 1. 啟動載入動畫
+        # try:
+        #     send_loading(user_id, loading_seconds=30)
+        #     print(f"▶️ Loading animation started for {user_id[:8]}")
+        # except Exception as e:
+        #     print(f"⚠️ Loading failed: {e}")
+        
+        # # 2. 立即回覆確認（如果 reply_token 還有效）
+        # if reply_token:
+        #     try:
+        #         line_bot_api.reply_message(
+        #             reply_token,
+        #             TextSendMessage(text="正在為您思考中...")
+        #         )
+        #         print(f"💭 Confirmation sent for {user_id[:8]}")
+        #     except Exception as e:
+        #         print(f"⚠️ Confirmation failed: {e}")
+        
+        # 3. 呼叫 GPT
+        start_time = time.time()
+        response = GPT_response_direct(user_id, text)
+        elapsed = time.time() - start_time
+        
+        print(f"✅ GPT response for {user_id[:8]} in {elapsed:.1f}s")
+        print(f"📄 Response preview: {response[:100]}...")
+        
+        # 4. 發送回應
+        if len(response) > 3000:
+            response = response[:3000] + "\n\n[訊息已截斷]"
+        
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text=response)
+            )
+            print(f"📤 Response sent to {user_id[:8]} ({len(response)} chars)")
+        except Exception as e:
+            print(f"❌ Push message failed: {e}")
+            
+            # 嘗試使用 reply_token 作為備用
+            if reply_token:
+                try:
+                    line_bot_api.reply_message(
+                        reply_token,
+                        TextSendMessage(text=response)
+                    )
+                    print(f"📤 Response sent via reply_token")
+                except Exception as e2:
+                    print(f"❌ Reply token also failed: {e2}")
+        
+    except Exception as e:
+        print(f"❌❌❌ Background processing error: {e}")
+        traceback.print_exc()
+        
+        # 發送錯誤安慰訊息
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text="Sorry, there were some issues during processing. Please try again later.。")
+            )
+        except:
+            pass
 
 # =============================================
 # 資源監控
@@ -511,7 +205,7 @@ def save_message_optimized(user_id, role, content):
         return False
 
 # =============================================
-# GPT_response 函數 - 移除所有錯誤訊息
+# GPT_response 函數
 # =============================================
 
 def GPT_response_direct(user_id, text):
@@ -631,8 +325,9 @@ def GPT_response_direct(user_id, text):
             redis_db.delete(conv_key)
             redis_db.delete(f"t:{user_id}")
             print(f"Periodic cleanup for {user_id[:8]}")
+        
+        # 硬碟儲存（如果啟用）
         if DISK_ENABLED:
-            # 在背景執行硬碟儲存
             threading.Thread(
                 target=save_to_disk_in_background,
                 args=(user_id,),
@@ -644,6 +339,7 @@ def GPT_response_direct(user_id, text):
         print(f"GPT_response error: {e}")
         # 返回中性回應，而不是錯誤訊息
         return "I'm currently processing your request. Please give me a moment to think."
+
 def save_to_disk_in_background(user_id):
     """背景執行：儲存對話到硬碟"""
     try:
@@ -671,7 +367,7 @@ def save_to_disk_in_background(user_id):
                 continue
         
         # 儲存到硬碟
-        if messages_list:
+        if messages_list and DISK_ENABLED:
             success = disk_storage.save_student_conversation(student_id, messages_list)
             if success:
                 print(f"💾 Disk save successful for {student_id[:8]} ({len(messages_list)} messages)")
@@ -680,27 +376,12 @@ def save_to_disk_in_background(user_id):
         
     except Exception as e:
         print(f"⚠️  Background disk save failed: {e}")
-def GPT_response(user_id, text):
-    """新的 GPT_response，使用隊列處理"""
-    try:
-        print(f"📨 Received request from {user_id[:8]}: {text[:30]}...")
-        
-        # 使用批處理器（會轉到零失敗系統）
-        result = openai_processor.process(user_id, text)
-        
-        print(f"✅ Response ready for {user_id[:8]}")
-        return result
-        
-    except Exception as e:
-        print(f"❌ Error in queued GPT_response: {e}")
-        # 返回中性訊息
-        return "Processing your question now. You'll receive an answer shortly."
 
 # =============================================
 # LINE 載入動畫函數
 # =============================================
 
-def send_loading(chat_id):
+def send_loading(chat_id, loading_seconds=60):
     """發送載入動畫"""
     try:
         url = 'https://api.line.me/v2/bot/chat/loading/start'
@@ -708,17 +389,17 @@ def send_loading(chat_id):
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {os.getenv("CHANNEL_ACCESS_TOKEN")}'
         }
-        data = {"chatId": chat_id, "loadingSeconds": 60}
+        data = {"chatId": chat_id, "loadingSeconds": loading_seconds}
         response = requests.post(url, headers=headers, json=data, timeout=3)
         if response.status_code == 200:
-            print(f"▶️ Started loading animation for {chat_id[:8]}")
+            print(f"▶️ Started loading animation for {chat_id[:8]} ({loading_seconds}s)")
         return True
     except Exception as e:
         print(f"Failed to start loading: {e}")
         return False
 
 def stop_loading(chat_id):
-    """停止載入動畫"""
+    """停止載入動畫（可選，載入動畫會自動停止）"""
     try:
         url = 'https://api.line.me/v2/bot/chat/loading/stop'
         headers = {
@@ -735,7 +416,7 @@ def stop_loading(chat_id):
         return False
 
 # =============================================
-# LINE Webhook 處理 - 簡化版本
+# LINE Webhook 處理
 # =============================================
 
 @app.route("/callback", methods=['POST'])
@@ -758,7 +439,7 @@ def handle_message(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
 
-    print(f"📩 LINE Message received: {user_id} said: {user_msg[:50]}")
+    print(f"📩 LINE Message received: {user_id[:8]} said: {user_msg[:50]}")
 
     # 防重複處理
     if redis_db.get(f"p:{msg_id}"):
@@ -773,61 +454,20 @@ def handle_message(event):
             redis_db.delete(f"p:{msg_id}")
             return
     
-    # 方法1：立即開始載入動畫（唯一的使用者回饋）
+    # 立即撥放動畫
     try:
         send_loading(user_id)
         print(f"▶️ Started loading animation for {user_id}")
     except Exception as e:
         print(f"⚠️  Failed to start loading: {e}")
-        # 如果載入動畫失敗，還是繼續處理，但不顯示動畫
     
-    #使用直接處理（繞過可能有問題的隊列）
-    def process_and_respond():
-        try:
-            print(f"🔧 Starting direct processing for {user_id}")
-            
-            # 直接呼叫 GPT
-            response = GPT_response_direct(user_id, user_msg)
-            
-            print(f"✅ GPT response received for {user_id}")
-            
-            # 停止載入動畫
-            try:
-                stop_loading(user_id)
-                print(f"⏹️ Stopped loading animation for {user_id}")
-            except:
-                pass
-            
-            # 發送回應（只發送 AI 的回應，沒有其他文字）
-            if len(response) > 3000:
-                response = response[:3000] + "\n\n[訊息已截斷]"
-            
-            try:
-                line_bot_api.push_message(
-                    user_id,
-                    TextSendMessage(text=response)
-                )
-                print(f"📤 Sent AI response to {user_id}")
-            except Exception as e:
-                print(f"❌ Failed to send AI response: {e}")
-                
-        except Exception as e:
-            print(f"❌ Processing failed: {e}")
-            traceback.print_exc()
-            
-            # 停止載入動畫
-            try:
-                stop_loading(user_id)
-            except:
-                pass
-    # 啟動背景執行緒
-    thread = threading.Thread(target=process_and_respond, daemon=True)
-    thread.start()
+    # 提交到背景處理隊列
+    thread_pool.submit(process_in_background, user_id, user_msg, reply_token)
     
-    print(f"✅ Message processing started for {user_id}")
+    print(f"✅ Message submitted to thread pool for {user_id[:8]}")
 
 # =============================================
-# 管理端點 - 增強版本
+# 管理端點
 # =============================================
 
 @app.route("/health", methods=['GET'])
@@ -835,54 +475,21 @@ def health_check():
     try:
         redis_db.ping()
         stats = monitor.get_stats()
-        zero_failure_stats = zero_failure_system.get_stats()
         
         return jsonify({
             "status": "healthy",
             "resources": stats,
-            "zero_failure_system": zero_failure_stats,
+            "thread_pool": {
+                "max_workers": thread_pool._max_workers,
+                "active_threads": len([t for t in threading.enumerate() if t.name.startswith("ThreadPool")])
+            },
             "config": {
-                "max_concurrent": MAX_CONCURRENT_REQUESTS,
                 "max_thread_messages": MAX_THREAD_MESSAGES,
-                "max_workers": MAX_WORKERS
+                "disk_storage": "enabled" if DISK_ENABLED else "disabled"
             }
         }), 200
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
-
-@app.route("/processor-stats", methods=['GET'])
-def processor_stats():
-    """查看處理器狀態"""
-    zero_failure_stats = zero_failure_system.get_stats()
-    
-    stats = {
-        "max_concurrent": openai_processor.max_concurrent,
-        "total_requests": openai_processor.request_count,
-        "current_semaphore_value": openai_processor.semaphore._value,
-        "active_requests": openai_processor.max_concurrent - openai_processor.semaphore._value,
-        "zero_failure_system": zero_failure_stats,
-        "timestamp": datetime.now().isoformat()
-    }
-    return jsonify(stats)
-
-@app.route("/zero-failure-stats", methods=['GET'])
-def zero_failure_stats():
-    """查看零失敗系統詳細狀態"""
-    stats = zero_failure_system.get_stats()
-    
-    # 添加詳細資訊
-    detailed_stats = {
-        **stats,
-        "system_info": {
-            "description": "Zero-failure guaranteed response system",
-            "max_workers": zero_failure_system.max_workers,
-            "guarantee": "Infinite retry until success",
-            "loading_animation": "Auto-managed with periodic restart"
-        },
-        "status": "operational"
-    }
-    
-    return jsonify(detailed_stats)
 
 @app.route("/export/conversations", methods=['GET'])
 def export_conversations():
@@ -933,253 +540,6 @@ def export_conversations():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/test-simple", methods=['POST', 'GET'])
-def test_simple():
-    """極簡測試端點"""
-    try:
-        print("✅ /test-simple endpoint called")
-        
-        if request.method == 'GET':
-            return jsonify({
-                "status": "ready",
-                "endpoint": "/test-simple",
-                "message": "Use POST to test OpenAI",
-                "zero_failure_system": "enabled"
-            }), 200
-        
-        # POST 請求：實際測試 OpenAI
-        data = request.json or {}
-        user_id = data.get('user_id', 'test_user_001')
-        message = data.get('message', 'Hello, please respond.')
-        
-        print(f"🎯 Testing OpenAI for user: {user_id}")
-        print(f"📝 Message: {message}")
-        
-        # 使用零失敗系統
-        task_id = zero_failure_system.submit_task(user_id, message)
-        
-        # 等待結果（最多30秒）
-        start_time = time.time()
-        while time.time() - start_time < 30:
-            if task_id in zero_failure_system.completed_tasks:
-                response_text = zero_failure_system.completed_tasks[task_id]['response']
-                duration = time.time() - start_time
-                
-                print(f"✅ Zero-failure response received in {duration:.1f}s")
-                print(f"📄 Response: {response_text[:100]}...")
-                
-                return jsonify({
-                    "success": True,
-                    "task_id": task_id,
-                    "user_id": user_id,
-                    "response": response_text[:1000],
-                    "response_length": len(response_text),
-                    "duration_seconds": round(duration, 2),
-                    "via_zero_failure": True,
-                    "timestamp": datetime.now().isoformat()
-                }), 200
-            
-            time.sleep(0.5)
-        
-        # 超時
-        return jsonify({
-            "success": False,
-            "task_id": task_id,
-            "error": "Timeout waiting for response",
-            "message": "Task is still processing in zero-failure system",
-            "timestamp": datetime.now().isoformat()
-        }), 408
-        
-    except Exception as e:
-        print(f"❌ Error in /test-simple: {e}")
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
-@app.route("/download/conversations", methods=['GET'])
-def download_conversations():
-    """下載所有對話紀錄"""
-    try:
-        secret = request.args.get('secret')
-        if secret != os.getenv('EXPORT_SECRET', 'default123'):
-            return jsonify({"error": "Unauthorized"}), 401
-        
-        format_type = request.args.get('format', 'json')
-        user_id = request.args.get('user_id')
-        date_str = request.args.get('date')
-        
-        # 如果啟用了硬碟儲存，從硬碟讀取
-        if DISK_ENABLED:
-            if user_id:
-                # 下載特定使用者
-                student_id = generate_anonymous_id(user_id)
-                conversations = disk_storage.get_user_conversations(student_id, date_str)
-                
-                if format_type == 'txt':
-                    # 轉換為文字格式
-                    text_output = f"Conversations for user: {user_id}\n"
-                    text_output += f"Date: {date_str or 'all'}\n"
-                    text_output += "=" * 50 + "\n\n"
-                    
-                    for conv in conversations:
-                        timestamp = conv.get('timestamp', '')
-                        role = conv.get('role', '')
-                        content = conv.get('content', '')
-                        text_output += f"[{timestamp}] {role.upper()}: {content}\n\n"
-                    
-                    response = make_response(text_output)
-                    response.headers['Content-Type'] = 'text/plain; charset=utf-8'
-                    response.headers['Content-Disposition'] = f'attachment; filename=conversations_{user_id[:8]}.txt'
-                    return response
-                    
-                else:
-                    # JSON 格式
-                    return jsonify({
-                        "user_id": user_id,
-                        "student_id": student_id,
-                        "total_messages": len(conversations),
-                        "conversations": conversations,
-                        "export_time": datetime.now().isoformat()
-                    }), 200
-            else:
-                # 下載所有使用者
-                all_data = disk_storage.export_all_data()
-                
-                return jsonify({
-                    "total_users": len(all_data),
-                    "data": all_data,
-                    "export_time": datetime.now().isoformat(),
-                    "note": "This is disk-stored data"
-                }), 200
-        else:
-            # 使用原有的 Redis 匯出功能
-            return export_conversations()
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/disk/status", methods=['GET'])
-def disk_status():
-    """檢查硬碟儲存狀態"""
-    if not DISK_ENABLED:
-        return jsonify({
-            "enabled": False,
-            "message": "Disk storage is not enabled"
-        }), 200
-    
-    try:
-        # 檢查硬碟空間
-        import shutil
-        
-        base_path = disk_storage.base_path
-        total, used, free = shutil.disk_usage(base_path)
-        
-        # 統計使用者數量
-        users_dir = os.path.join(base_path, "users")
-        user_count = 0
-        total_files = 0
-        
-        if os.path.exists(users_dir):
-            user_count = len([d for d in os.listdir(users_dir) 
-                            if os.path.isdir(os.path.join(users_dir, d))])
-            
-            for root, dirs, files in os.walk(users_dir):
-                total_files += len(files)
-        
-        return jsonify({
-            "enabled": True,
-            "base_path": base_path,
-            "disk_space": {
-                "total_gb": round(total / (1024**3), 2),
-                "used_gb": round(used / (1024**3), 2),
-                "free_gb": round(free / (1024**3), 2),
-                "free_percent": round(free / total * 100, 2)
-            },
-            "data_stats": {
-                "total_users": user_count,
-                "total_files": total_files,
-                "last_check": datetime.now().isoformat()
-            }
-        }), 200
-        
-    except Exception as e:
-        return jsonify({
-            "enabled": True,
-            "error": str(e)
-        }), 500
-
-@app.route("/disk/cleanup", methods=['POST'])
-def disk_cleanup():
-    """清理舊的硬碟資料"""
-    secret = request.json.get('secret') if request.json else request.args.get('secret')
-    if secret != os.getenv('EXPORT_SECRET', 'default123'):
-        return jsonify({"error": "Unauthorized"}), 401
-    
-    if not DISK_ENABLED:
-        return jsonify({"error": "Disk storage not enabled"}), 400
-    
-    try:
-        import time
-        from datetime import datetime, timedelta
-        
-        users_dir = os.path.join(disk_storage.base_path, "users")
-        days_to_keep = int(request.args.get('days', 30))
-        
-        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-        deleted_files = 0
-        
-        for user_id in os.listdir(users_dir):
-            user_dir = os.path.join(users_dir, user_id)
-            if os.path.isdir(user_dir):
-                for filename in os.listdir(user_dir):
-                    if filename.endswith('.json'):
-                        # 從檔名解析日期
-                        try:
-                            file_date = datetime.strptime(filename.replace('.json', ''), '%Y-%m-%d')
-                            if file_date < cutoff_date:
-                                file_path = os.path.join(user_dir, filename)
-                                os.remove(file_path)
-                                deleted_files += 1
-                        except:
-                            continue
-        
-        return jsonify({
-            "success": True,
-            "deleted_files": deleted_files,
-            "days_kept": days_to_keep,
-            "cutoff_date": cutoff_date.strftime('%Y-%m-%d')
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-@app.route("/download/file/<path:filename>", methods=['GET'])
-def download_file(filename):
-    """直接下載檔案"""
-    secret = request.args.get('secret')
-    if secret != os.getenv('EXPORT_SECRET', 'default123'):
-        return jsonify({"error": "Unauthorized"}), 401
-    
-    if not DISK_ENABLED:
-        return jsonify({"error": "Disk storage not enabled"}), 400
-    
-    try:
-        # 安全性檢查：確保檔案在允許的路徑內
-        safe_path = os.path.join(disk_storage.base_path, "users")
-        file_path = os.path.join(safe_path, filename)
-        
-        # 防止路徑遍歷攻擊
-        if not os.path.abspath(file_path).startswith(os.path.abspath(safe_path)):
-            return jsonify({"error": "Access denied"}), 403
-        
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True)
-        else:
-            return jsonify({"error": "File not found"}), 404
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 # =============================================
 # 啟動
 # =============================================
@@ -1187,16 +547,15 @@ def download_file(filename):
 if __name__ == "__main__":
     print(f"""
     ========================================
-    🚀 ZERO-FAILURE LINE BOT STARTING
+    🚀 SIMPLE LINE BOT STARTING
     ========================================
     Features:
-    ✅ Zero-failure guaranteed response system
-    ✅ Auto-managed loading animations
+    ✅ Simple thread pool system
+    ✅ Loading animations
     ✅ No error messages to users
-    ✅ Infinite retry until success
+    ✅ Background processing
     
-    OpenAI Queue: {openai_processor.max_concurrent} concurrent
-    Max Workers: {MAX_WORKERS}
+    Thread Pool: {thread_pool._max_workers} workers
     Disk Storage: {'✅ Enabled' if DISK_ENABLED else '❌ Disabled'}
     ========================================
     """)
