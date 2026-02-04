@@ -33,18 +33,21 @@ app = Flask(__name__)
 # =============================================
 # 零失敗保證系統
 # =============================================
-
 class GuaranteedResponseSystem:
     """保證回應系統 - 永不失敗，持續重試直到成功"""
     
     def __init__(self, max_workers=5):
-        self.pending_queue = queue.Queue()  # 待處理隊列
-        self.processing_tasks = {}          # 正在處理的任務
-        self.completed_tasks = {}           # 已完成的任務
-        self.task_status = {}               # 任務狀態追蹤
+        self.pending_queue = queue.Queue()
+        self.processing_tasks = {}
+        self.completed_tasks = {}
+        self.task_status = {}
         self.max_workers = max_workers
-        self.loading_sessions = {}          # 正在顯示載入動畫的會話
+        self.loading_sessions = {}
         self.lock = threading.Lock()
+        self.workers = []  # 新增：儲存 worker 參考
+        self.is_running = True  # 新增：運行標記
+        
+        print(f"🛠️  Initializing {max_workers} workers...")
         
         # 啟動工作者執行緒
         for i in range(max_workers):
@@ -55,7 +58,8 @@ class GuaranteedResponseSystem:
                 name=f"Worker-{i}"
             )
             worker.start()
-            print(f"🚀 Zero-failure worker {i} started")
+            self.workers.append(worker)
+            print(f"✅ Worker {i} started (ID: {worker.ident})")
         
         # 啟動監控執行緒
         monitor = threading.Thread(
@@ -72,28 +76,29 @@ class GuaranteedResponseSystem:
             name="Loading-Manager"
         )
         loading_manager.start()
+        
+        print(f"🚀 All {max_workers} workers initialized and ready")
     
     def _worker_loop(self, worker_id):
         """工作者執行緒 - 永不停止，持續處理任務"""
-        while True:
+        print(f"👷 Worker {worker_id} loop STARTED")
+        
+        while self.is_running:
             try:
-                # 從隊列獲取任務（阻塞等待）
-                task_data = self.pending_queue.get()
-                if task_data is None:
+                print(f"⏳ Worker {worker_id} waiting for task...")
+                
+                # 從隊列獲取任務（阻塞等待，timeout=1秒以便檢查運行狀態）
+                try:
+                    task_data = self.pending_queue.get(timeout=1)
+                except queue.Empty:
+                    continue  # 如果隊列空，繼續等待
+                
+                if task_data is None:  # 停止信號
                     break
                 
                 task_id, task = task_data
                 
-                with self.lock:
-                    self.processing_tasks[task_id] = task
-                    self.task_status[task_id] = {
-                        'status': 'processing',
-                        'worker_id': worker_id,
-                        'started_at': datetime.now().isoformat(),
-                        'retry_count': 0
-                    }
-                
-                print(f"👷 Worker {worker_id} processing task {task_id[:8]} "
+                print(f"👷 Worker {worker_id} START processing task {task_id[:8]} "
                       f"for {task['user_id'][:8]}")
                 
                 # 處理任務（無限重試直到成功）
@@ -102,9 +107,14 @@ class GuaranteedResponseSystem:
                 # 標記隊列完成
                 self.pending_queue.task_done()
                 
+                print(f"👷 Worker {worker_id} FINISHED task {task_id[:8]}")
+                
             except Exception as e:
                 print(f"❌ Worker {worker_id} loop error: {str(e)[:100]}")
-                time.sleep(10)  # 錯誤後休息10秒
+                traceback.print_exc()
+                time.sleep(5)  # 錯誤後休息5秒
+        
+        print(f"👷 Worker {worker_id} loop STOPPED")
     
     def _process_with_infinite_retry(self, worker_id, task_id, task):
         """無限重試直到成功"""
