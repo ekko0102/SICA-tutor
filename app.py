@@ -708,7 +708,7 @@ def send_loading(chat_id):
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {os.getenv("CHANNEL_ACCESS_TOKEN")}'
         }
-        data = {"chatId": chat_id, "loadingSeconds": 9}
+        data = {"chatId": chat_id, "loadingSeconds": 60}
         response = requests.post(url, headers=headers, json=data, timeout=3)
         if response.status_code == 200:
             print(f"▶️ Started loading animation for {chat_id[:8]}")
