@@ -85,7 +85,7 @@ class GuaranteedResponseSystem:
         
         while self.is_running:
             try:
-                print(f"⏳ Worker {worker_id} waiting for task...")
+                # print(f"⏳ Worker {worker_id} waiting for task...")
 
                 # 從隊列獲取任務（阻塞等待，timeout=1秒以便檢查運行狀態）
                 try:
@@ -782,59 +782,44 @@ def handle_message(event):
         # 如果載入動畫失敗，還是繼續處理，但不顯示動畫
     
     #使用直接處理（繞過可能有問題的隊列）
-    # def process_and_respond():
-    #     try:
-    #         print(f"🔧 Starting direct processing for {user_id}")
+    def process_and_respond():
+        try:
+            print(f"🔧 Starting direct processing for {user_id}")
             
-    #         # 直接呼叫 GPT
-    #         response = GPT_response_direct(user_id, user_msg)
+            # 直接呼叫 GPT
+            response = GPT_response_direct(user_id, user_msg)
             
-    #         print(f"✅ GPT response received for {user_id}")
+            print(f"✅ GPT response received for {user_id}")
             
-    #         # 停止載入動畫
-    #         try:
-    #             stop_loading(user_id)
-    #             print(f"⏹️ Stopped loading animation for {user_id}")
-    #         except:
-    #             pass
+            # 停止載入動畫
+            try:
+                stop_loading(user_id)
+                print(f"⏹️ Stopped loading animation for {user_id}")
+            except:
+                pass
             
-    #         # 發送回應（只發送 AI 的回應，沒有其他文字）
-    #         if len(response) > 3000:
-    #             response = response[:3000] + "\n\n[訊息已截斷]"
+            # 發送回應（只發送 AI 的回應，沒有其他文字）
+            if len(response) > 3000:
+                response = response[:3000] + "\n\n[訊息已截斷]"
             
-    #         try:
-    #             line_bot_api.push_message(
-    #                 user_id,
-    #                 TextSendMessage(text=response)
-    #             )
-    #             print(f"📤 Sent AI response to {user_id}")
-    #         except Exception as e:
-    #             print(f"❌ Failed to send AI response: {e}")
+            try:
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=response)
+                )
+                print(f"📤 Sent AI response to {user_id}")
+            except Exception as e:
+                print(f"❌ Failed to send AI response: {e}")
                 
-    #     except Exception as e:
-    #         print(f"❌ Processing failed: {e}")
-    #         traceback.print_exc()
+        except Exception as e:
+            print(f"❌ Processing failed: {e}")
+            traceback.print_exc()
             
-    #         # 停止載入動畫
-    #         try:
-    #             stop_loading(user_id)
-    #         except:
-    #             pass
-    print(f"📩 LINE Message received: {user_id} said: {user_msg[:50]}")
-    
-    # ✅ 應該提交任務到零失敗系統
-    task_id = zero_failure_system.submit_task(user_id, user_msg, reply_token)
-    
-    print(f"✅ Task submitted: {task_id[:8]}")
-    
-    # 立即回覆確認
-    try:
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text="已收到，正在處理中...")
-        )
-    except:
-        pass
+            # 停止載入動畫
+            try:
+                stop_loading(user_id)
+            except:
+                pass
     # 啟動背景執行緒
     thread = threading.Thread(target=process_and_respond, daemon=True)
     thread.start()
