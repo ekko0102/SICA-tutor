@@ -86,7 +86,7 @@ class GuaranteedResponseSystem:
         while self.is_running:
             try:
                 print(f"⏳ Worker {worker_id} waiting for task...")
-                
+
                 # 從隊列獲取任務（阻塞等待，timeout=1秒以便檢查運行狀態）
                 try:
                     task_data = self.pending_queue.get(timeout=1)
@@ -820,63 +820,21 @@ def handle_message(event):
     #             stop_loading(user_id)
     #         except:
     #             pass
-            
-            # 重要：即使失敗也不發送錯誤訊息給使用者
-            # 只在後台記錄錯誤
-    # ✅ 改為使用零失敗系統處理
-    def process_with_zero_failure():
-        try:
-            print(f"🔧 Submitting to zero-failure system for {user_id}")
-            
-            # 提交任務到零失敗系統
-            task_id = zero_failure_system.submit_task(user_id, user_msg, reply_token)
-            
-            # 等待任務完成
-            start_time = time.time()
-            max_wait = 60  # 最多等待60秒
-            
-            while time.time() - start_time < max_wait:
-                if task_id in zero_failure_system.completed_tasks:
-                    print(f"✅ Task completed via zero-failure system for {user_id}")
-                    
-                    # 停止載入動畫
-                    try:
-                        stop_loading(user_id)
-                        print(f"⏹️ Stopped loading animation for {user_id}")
-                    except:
-                        pass
-                    
-                    # 任務已經由零失敗系統發送回應
-                    return
-                
-                time.sleep(1)
-            
-            print(f"⏰ Timeout waiting for zero-failure system for {user_id}")
-            
-            # 如果超時，發送一個安慰訊息
-            try:
-                line_bot_api.push_message(
-                    user_id,
-                    TextSendMessage(text="您的請求正在處理中，請稍候...")
-                )
-            except:
-                pass
-                
-            # 停止載入動畫
-            try:
-                stop_loading(user_id)
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"❌ Zero-failure processing failed: {e}")
-            traceback.print_exc()
-            
-            # 停止載入動畫
-            try:
-                stop_loading(user_id)
-            except:
-                pass
+    print(f"📩 LINE Message received: {user_id} said: {user_msg[:50]}")
+    
+    # ✅ 應該提交任務到零失敗系統
+    task_id = zero_failure_system.submit_task(user_id, user_msg, reply_token)
+    
+    print(f"✅ Task submitted: {task_id[:8]}")
+    
+    # 立即回覆確認
+    try:
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text="已收到，正在處理中...")
+        )
+    except:
+        pass
     # 啟動背景執行緒
     thread = threading.Thread(target=process_and_respond, daemon=True)
     thread.start()
