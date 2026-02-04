@@ -15,7 +15,7 @@ import threading
 import concurrent.futures
 import uuid
 import queue
-from disk_config import disk
+from disk_config import disk_storage
 from collections import defaultdict
 
 app = Flask(__name__)
