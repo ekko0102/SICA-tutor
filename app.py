@@ -1158,6 +1158,32 @@ def disk_cleanup():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+@app.route("/download/file/<path:filename>", methods=['GET'])
+def download_file(filename):
+    """直接下載檔案"""
+    secret = request.args.get('secret')
+    if secret != os.getenv('EXPORT_SECRET', 'default123'):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    if not DISK_ENABLED:
+        return jsonify({"error": "Disk storage not enabled"}), 400
+    
+    try:
+        # 安全性檢查：確保檔案在允許的路徑內
+        safe_path = os.path.join(disk_storage.base_path, "users")
+        file_path = os.path.join(safe_path, filename)
+        
+        # 防止路徑遍歷攻擊
+        if not os.path.abspath(file_path).startswith(os.path.abspath(safe_path)):
+            return jsonify({"error": "Access denied"}), 403
+        
+        if os.path.exists(file_path):
+            return send_file(file_path, as_attachment=True)
+        else:
+            return jsonify({"error": "File not found"}), 404
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # =============================================
 # 啟動
 # =============================================
