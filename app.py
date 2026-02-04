@@ -663,7 +663,249 @@ def export_conversations():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+# =============================================
+# 對話紀錄下載功能
+# =============================================
 
+@app.route("/download/conversations", methods=['GET'])
+def download_conversations():
+    """下載所有對話紀錄"""
+    try:
+        secret = request.args.get('secret')
+        if secret != os.getenv('EXPORT_SECRET', 'default123'):
+            return jsonify({"error": "Unauthorized"}), 401
+        
+        format_type = request.args.get('format', 'json')
+        user_id = request.args.get('user_id')
+        date_str = request.args.get('date')
+        
+        # 如果啟用了硬碟儲存，從硬碟讀取
+        if DISK_ENABLED:
+            if user_id:
+                # 下載特定使用者
+                student_id = generate_anonymous_id(user_id)
+                conversations = disk_storage.get_user_conversations(student_id, date_str)
+                
+                if format_type == 'txt':
+                    # 轉換為文字格式
+                    text_output = f"Conversations for user: {user_id}\n"
+                    text_output += f"Student ID: {student_id}\n"
+                    text_output += f"Date: {date_str or 'all'}\n"
+                    text_output += "=" * 50 + "\n\n"
+                    
+                    for conv in conversations:
+                        timestamp = conv.get('timestamp', '')
+                        role = conv.get('role', 'unknown')
+                        content = conv.get('content', '')
+                        
+                        # 格式化時間
+                        try:
+                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            time_display = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except:
+                            time_display = timestamp
+                        
+                        role_display = "USER" if role == "user" else "ASSISTANT"
+                        text_output += f"[{time_display}] {role_display}:\n{content}\n\n"
+                    
+                    response = make_response(text_output)
+                    response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+                    response.headers['Content-Disposition'] = f'attachment; filename=conversations_{user_id[:8]}_{datetime.now().strftime("%Y%m%d")}.txt'
+                    return response
+                    
+                else:
+                    # JSON 格式
+                    return jsonify({
+                        "user_id": user_id,
+                        "student_id": student_id,
+                        "total_messages": len(conversations),
+                        "conversations": conversations,
+                        "export_time": datetime.now().isoformat()
+                    }), 200
+            else:
+                # 下載所有使用者
+                all_data = disk_storage.export_all_data()
+                
+                return jsonify({
+                    "total_users": len(all_data),
+                    "data": all_data,
+                    "export_time": datetime.now().isoformat(),
+                    "note": "This is disk-stored data"
+                }), 200
+        else:
+            # 使用原有的 Redis 匯出功能
+            return export_conversations_from_redis()
+            
+    except Exception as e:
+        print(f"❌ Download error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+def export_conversations_from_redis():
+    """從 Redis 匯出對話紀錄"""
+    try:
+        all_data = []
+        cursor = '0'
+        
+        while True:
+            cursor, keys = redis_db.scan(cursor, match="h:*", count=30)
+            
+            for key in keys:
+                student_id = key.split(":")[1]
+                messages = redis_db.lrange(key, 0, -1)
+                
+                student_msgs = []
+                for msg_json in messages:
+                    try:
+                        msg = json.loads(msg_json)
+                        student_msgs.append({
+                            "student_id": msg["s"],
+                            "role": "user" if msg["r"] == "u" else "assistant",
+                            "content": msg["c"],
+                            "timestamp": msg["t"]
+                        })
+                    except:
+                        continue
+                
+                if student_msgs:
+                    all_data.append({
+                        "student_id": student_id,
+                        "total_messages": len(student_msgs),
+                        "messages": student_msgs[:100]  # 限制每個使用者最多100條
+                    })
+            
+            if cursor == '0':
+                break
+        
+        return jsonify({
+            "export_time": datetime.now().isoformat(),
+            "total_students": len(all_data),
+            "data": all_data,
+            "note": "This is Redis-stored data"
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/disk/status", methods=['GET'])
+def disk_status():
+    """檢查硬碟儲存狀態"""
+    if not DISK_ENABLED:
+        return jsonify({
+            "enabled": False,
+            "message": "Disk storage is not enabled"
+        }), 200
+    
+    try:
+        import shutil
+        
+        base_path = disk_storage.base_path
+        total, used, free = shutil.disk_usage(base_path)
+        
+        # 統計使用者數量
+        users_dir = os.path.join(base_path, "users")
+        user_count = 0
+        total_files = 0
+        
+        if os.path.exists(users_dir):
+            user_count = len([d for d in os.listdir(users_dir) 
+                            if os.path.isdir(os.path.join(users_dir, d))])
+            
+            for root, dirs, files in os.walk(users_dir):
+                total_files += len(files)
+        
+        return jsonify({
+            "enabled": True,
+            "base_path": base_path,
+            "disk_space": {
+                "total_gb": round(total / (1024**3), 2),
+                "used_gb": round(used / (1024**3), 2),
+                "free_gb": round(free / (1024**3), 2),
+                "free_percent": round(free / total * 100, 2)
+            },
+            "data_stats": {
+                "total_users": user_count,
+                "total_files": total_files,
+                "last_check": datetime.now().isoformat()
+            }
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "enabled": True,
+            "error": str(e)
+        }), 500
+
+@app.route("/disk/cleanup", methods=['POST'])
+def disk_cleanup():
+    """清理舊的硬碟資料"""
+    secret = request.json.get('secret') if request.json else request.args.get('secret')
+    if secret != os.getenv('EXPORT_SECRET', 'default123'):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    if not DISK_ENABLED:
+        return jsonify({"error": "Disk storage not enabled"}), 400
+    
+    try:
+        import time
+        from datetime import datetime, timedelta
+        
+        users_dir = os.path.join(disk_storage.base_path, "users")
+        days_to_keep = int(request.args.get('days', 30))
+        
+        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+        deleted_files = 0
+        
+        for user_id in os.listdir(users_dir):
+            user_dir = os.path.join(users_dir, user_id)
+            if os.path.isdir(user_dir):
+                for filename in os.listdir(user_dir):
+                    if filename.endswith('.json'):
+                        # 從檔名解析日期
+                        try:
+                            file_date = datetime.strptime(filename.replace('.json', ''), '%Y-%m-%d')
+                            if file_date < cutoff_date:
+                                file_path = os.path.join(user_dir, filename)
+                                os.remove(file_path)
+                                deleted_files += 1
+                        except:
+                            continue
+        
+        return jsonify({
+            "success": True,
+            "deleted_files": deleted_files,
+            "days_kept": days_to_keep,
+            "cutoff_date": cutoff_date.strftime('%Y-%m-%d')
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/download/file/<path:filename>", methods=['GET'])
+def download_file(filename):
+    """直接下載檔案"""
+    secret = request.args.get('secret')
+    if secret != os.getenv('EXPORT_SECRET', 'default123'):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    if not DISK_ENABLED:
+        return jsonify({"error": "Disk storage not enabled"}), 400
+    
+    try:
+        # 安全性檢查：確保檔案在允許的路徑內
+        safe_path = os.path.join(disk_storage.base_path, "users")
+        file_path = os.path.join(safe_path, filename)
+        
+        # 防止路徑遍歷攻擊
+        if not os.path.abspath(file_path).startswith(os.path.abspath(safe_path)):
+            return jsonify({"error": "Access denied"}), 403
+        
+        if os.path.exists(file_path):
+            return send_file(file_path, as_attachment=True)
+        else:
+            return jsonify({"error": "File not found"}), 404
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # =============================================
 # 啟動
 # =============================================
