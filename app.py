@@ -208,52 +208,188 @@ def save_message_optimized(user_id, role, content):
 # GPT_response 函數
 # =============================================
 
+# def GPT_response_direct(user_id, text):
+#     """直接呼叫 OpenAI 的版本 - 透過 run_id 鎖定，解決回覆重複問題"""
+#     monitor.increment()
+#     # 儲存使用者訊息
+#     save_message_optimized(user_id, "user", text[:1500])
+    
+#     try:
+#         # 取得或創建 thread
+#         thread_id = redis_db.get(f"t:{user_id}")
+        
+#         # 1. 智能清理 thread 邏輯 (保持不變)
+#         if thread_id:
+#             try:
+#                 # 額外防護：先檢查有無還在跑的 run，有的話先取消，避免訊息堆疊
+#                 active_runs = client.beta.threads.runs.list(thread_id=thread_id)
+#                 for r in active_runs.data:
+#                     if r.status in ["in_progress", "queued"]:
+#                         client.beta.threads.runs.cancel(thread_id=thread_id, run_id=r.id)
+                
+#                 messages = client.beta.threads.messages.list(
+#                     thread_id=thread_id,
+#                     limit=MAX_THREAD_MESSAGES + 2,
+#                     timeout=10.0
+#                 )
+                
+#                 if len(messages.data) > MAX_THREAD_MESSAGES:
+#                     print(f"Cleaning thread ({len(messages.data)} -> 8)")
+#                     keep_messages = []
+#                     for msg in messages.data[:8]: # 取最近的 8 條
+#                         if hasattr(msg, 'content') and msg.content:
+#                             content = msg.content[0].text.value
+#                             keep_messages.append({
+#                                 "role": msg.role,
+#                                 "content": content[:800] + "..." if len(content) > 800 else content
+#                             })
+                    
+#                     if keep_messages:
+#                         new_thread = client.beta.threads.create(messages=keep_messages[::-1]) # 反轉順序符合 API 要求
+#                         thread_id = new_thread.id
+#                         redis_db.setex(f"t:{user_id}", 3600, thread_id)
+#             except Exception as e:
+#                 print(f"Thread cleanup error: {e}")
+#                 thread_id = None
+        
+#         # 2. 確保有 thread 並加入訊息
+#         if not thread_id:
+#             thread = client.beta.threads.create(
+#                 messages=[{"role": "user", "content": text[:1500]}]
+#             )
+#             thread_id = thread.id
+#             redis_db.setex(f"t:{user_id}", 3600, thread_id)
+#         else:
+#             client.beta.threads.messages.create(
+#                 thread_id=thread_id,
+#                 role="user",
+#                 content=text[:1500],
+#                 timeout=10.0
+#             )
+        
+#         # 3. 執行助理 (Run)
+#         run = client.beta.threads.runs.create(
+#             thread_id=thread_id, 
+#             assistant_id=ASSISTANT_ID,
+#             timeout=30.0
+#         )
+        
+#         # 4. 耐心等待完成 (增加最大等待安全鎖)
+#         start_wait = time.time()
+#         while run.status != "completed":
+#             if run.status in ["failed", "cancelled", "expired"]:
+#                 print(f"Run failed with status: {run.status}")
+#                 return "I'm sorry, I encountered an issue. Could you please try again?"
+            
+#             # 安全機制：單次等待超過 90 秒則跳出，避免 Thread 死結
+#             if time.time() - start_wait > 90:
+#                 print("Run timeout safety triggered.")
+#                 return "The system is a bit busy. Please try again in a moment."
+                
+#             time.sleep(1)
+#             run = client.beta.threads.runs.retrieve(
+#                 thread_id=thread_id, 
+#                 run_id=run.id,
+#                 timeout=10.0
+#             )
+        
+#         # 5. 【核心修正】取得回覆：強制鎖定本次 run.id
+#         # 這能確保即使 Thread 裡有舊回覆，也只會抓出這次生成的內容
+#         messages = client.beta.threads.messages.list(
+#             thread_id=thread_id,
+#             run_id=run.id,  # <-- 關鍵：只拿這個 Run 產生的訊息
+#             timeout=10.0
+#         )
+        
+#         if not messages.data:
+#             ai_reply = "I've received your request, but I couldn't generate a response. Please try again."
+#         else:
+#             # Assistant 的回覆通常在 messages.data[0]
+#             ai_reply = messages.data[0].content[0].text.value
+        
+#         # 儲存回覆與清理邏輯 (保持不變)
+#         save_message_optimized(user_id, "assistant", ai_reply[:2000])
+        
+#         conv_key = f"c:{user_id}"
+#         conv_count = redis_db.incr(conv_key)
+#         redis_db.expire(conv_key, 3600)
+        
+#         if conv_count >= 10:
+#             redis_db.delete(conv_key)
+#             redis_db.delete(f"t:{user_id}")
+#             print(f"Periodic cleanup for {user_id[:8]}")
+        
+#         if DISK_ENABLED:
+#             threading.Thread(
+#                 target=save_to_disk_in_background,
+#                 args=(user_id,),
+#                 daemon=True
+#             ).start()        
+            
+#         return ai_reply
+        
+#     except Exception as e:
+#         print(f"❌ GPT_response error: {e}")
+#         traceback.print_exc()
+#         return "I'm currently processing multiple requests. Please give me a moment to think."
 def GPT_response_direct(user_id, text):
-    """直接呼叫 OpenAI 的版本 - 透過 run_id 鎖定，解決回覆重複問題"""
+    """
+    優化版 GPT 回應函數：
+    1. 強制取消該 Thread 內所有舊的 Active Runs，防止舊答案(問題A)在背景復活。
+    2. 使用 run_id 精確提取本次對話內容。
+    3. 修正 Thread Cleanup 順序，確保歷史紀錄邏輯正確。
+    """
     monitor.increment()
     
-    # 儲存使用者訊息
+    # 儲存使用者訊息到本地 Redis 紀錄
     save_message_optimized(user_id, "user", text[:1500])
     
     try:
-        # 取得或創建 thread
+        # 取得 Thread ID
         thread_id = redis_db.get(f"t:{user_id}")
         
-        # 1. 智能清理 thread 邏輯 (保持不變)
+        # --- [優化 A：強力清理殭屍任務] ---
         if thread_id:
             try:
-                # 額外防護：先檢查有無還在跑的 run，有的話先取消，避免訊息堆疊
+                # 檢查是否有任何還在跑 (in_progress/queued) 的 Runs
+                # 這是解決「問 B 出現 A 答案」的關鍵防禦
                 active_runs = client.beta.threads.runs.list(thread_id=thread_id)
                 for r in active_runs.data:
-                    if r.status in ["in_progress", "queued"]:
-                        client.beta.threads.runs.cancel(thread_id=thread_id, run_id=r.id)
+                    if r.status in ["in_progress", "queued", "requires_action"]:
+                        print(f"🛑 Cancelling zombie run {r.id} for user {user_id[:8]}")
+                        try:
+                            client.beta.threads.runs.cancel(thread_id=thread_id, run_id=r.id)
+                        except:
+                            pass # 有可能在取消時剛好跑完，直接忽略
                 
+                # 智能清理過長 Thread 邏輯
                 messages = client.beta.threads.messages.list(
                     thread_id=thread_id,
-                    limit=MAX_THREAD_MESSAGES + 2,
+                    limit=MAX_THREAD_MESSAGES + 1, # 多取一個檢查是否超過
                     timeout=10.0
                 )
                 
                 if len(messages.data) > MAX_THREAD_MESSAGES:
                     print(f"Cleaning thread ({len(messages.data)} -> 8)")
+                    # 重要：OpenAI API 返回是倒序，需取前 8 筆並轉為正序建立新 Thread
+                    keep_msgs_raw = messages.data[:8]
                     keep_messages = []
-                    for msg in messages.data[:8]: # 取最近的 8 條
+                    for msg in reversed(keep_msgs_raw):
                         if hasattr(msg, 'content') and msg.content:
-                            content = msg.content[0].text.value
                             keep_messages.append({
                                 "role": msg.role,
-                                "content": content[:800] + "..." if len(content) > 800 else content
+                                "content": msg.content[0].text.value[:800]
                             })
                     
                     if keep_messages:
-                        new_thread = client.beta.threads.create(messages=keep_messages[::-1]) # 反轉順序符合 API 要求
+                        new_thread = client.beta.threads.create(messages=keep_messages)
                         thread_id = new_thread.id
                         redis_db.setex(f"t:{user_id}", 3600, thread_id)
             except Exception as e:
-                print(f"Thread cleanup error: {e}")
-                thread_id = None
+                print(f"⚠️ Thread maintenance error: {e}")
+                # 不中斷流程，thread_id 繼續使用
         
-        # 2. 確保有 thread 並加入訊息
+        # --- [優化 B：訊息寫入] ---
         if not thread_id:
             thread = client.beta.threads.create(
                 messages=[{"role": "user", "content": text[:1500]}]
@@ -268,58 +404,59 @@ def GPT_response_direct(user_id, text):
                 timeout=10.0
             )
         
-        # 3. 執行助理 (Run)
+        # --- [優化 C：啟動 Run 並嚴格監控狀態] ---
         run = client.beta.threads.runs.create(
             thread_id=thread_id, 
             assistant_id=ASSISTANT_ID,
             timeout=30.0
         )
         
-        # 4. 耐心等待完成 (增加最大等待安全鎖)
         start_wait = time.time()
-        while run.status != "completed":
-            if run.status in ["failed", "cancelled", "expired"]:
-                print(f"Run failed with status: {run.status}")
-                return "I'm sorry, I encountered an issue. Could you please try again?"
+        while run.status not in ["completed", "failed", "cancelled", "expired"]:
+            # 安全鎖：防止死迴圈消耗 Thread Pool 資源
+            if time.time() - start_wait > 80:
+                print(f"❌ Run {run.id} timeout. Breaking loop.")
+                return "抱歉，思考時間過長，請稍後再試。"
             
-            # 安全機制：單次等待超過 90 秒則跳出，避免 Thread 死結
-            if time.time() - start_wait > 90:
-                print("Run timeout safety triggered.")
-                return "The system is a bit busy. Please try again in a moment."
-                
-            time.sleep(1)
+            time.sleep(1.5) # 稍微增加間隔，減少 API 請求頻率
             run = client.beta.threads.runs.retrieve(
                 thread_id=thread_id, 
                 run_id=run.id,
                 timeout=10.0
             )
-        
-        # 5. 【核心修正】取得回覆：強制鎖定本次 run.id
-        # 這能確保即使 Thread 裡有舊回覆，也只會抓出這次生成的內容
+            
+        if run.status != "completed":
+            print(f"❌ Run ended with non-success status: {run.status}")
+            return "我現在思緒有點混亂，可以請您再說一次嗎？"
+
+        # --- [優化 D：精確提取 (Atomic Retrieval)] ---
+        # 這是解決「買一送二」最核心的改動：只拿這個 Run ID 產生的訊息
         messages = client.beta.threads.messages.list(
             thread_id=thread_id,
-            run_id=run.id,  # <-- 關鍵：只拿這個 Run 產生的訊息
+            run_id=run.id, 
             timeout=10.0
         )
         
         if not messages.data:
-            ai_reply = "I've received your request, but I couldn't generate a response. Please try again."
-        else:
-            # Assistant 的回覆通常在 messages.data[0]
-            ai_reply = messages.data[0].content[0].text.value
+            return "收到了您的訊息，但我暫時想不出更好的回答。"
+
+        # 取得助理回覆
+        ai_reply = messages.data[0].content[0].text.value
         
-        # 儲存回覆與清理邏輯 (保持不變)
+        # 儲存回覆
         save_message_optimized(user_id, "assistant", ai_reply[:2000])
         
+        # --- [優化 E：對話次數清理機制] ---
         conv_key = f"c:{user_id}"
         conv_count = redis_db.incr(conv_key)
         redis_db.expire(conv_key, 3600)
         
-        if conv_count >= 10:
+        if conv_count >= 15: # 稍微提高門檻，減少重建 Thread 頻率
             redis_db.delete(conv_key)
             redis_db.delete(f"t:{user_id}")
-            print(f"Periodic cleanup for {user_id[:8]}")
+            print(f"🗑️ Periodic cleanup executed for {user_id[:8]}")
         
+        # 背景存檔
         if DISK_ENABLED:
             threading.Thread(
                 target=save_to_disk_in_background,
@@ -330,10 +467,9 @@ def GPT_response_direct(user_id, text):
         return ai_reply
         
     except Exception as e:
-        print(f"❌ GPT_response error: {e}")
+        print(f"❌ Critical GPT_response error: {e}")
         traceback.print_exc()
-        return "I'm currently processing multiple requests. Please give me a moment to think."
-
+        return "系統目前稍微擁擠，請稍等幾秒後再試一次。"
 def save_to_disk_in_background(user_id):
     """背景執行：儲存對話到硬碟"""
     try:
@@ -433,16 +569,27 @@ def handle_message(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
 
-    print(f"📩 LINE Message received: {user_id[:8]} said: {user_msg[:50]}")
+    # print(f"📩 LINE Message received: {user_id[:8]} said: {user_msg[:50]}")
 
-    # 防重複處理
-    if redis_db.get(f"p:{msg_id}"):
-        print(f"⚠️  Duplicate message {msg_id}, skipping")
-        return 
-    redis_db.setex(f"p:{msg_id}", 90, "1")
+    # # 防重複處理
+    # if redis_db.get(f"p:{msg_id}"):
+    #     print(f"⚠️  Duplicate message {msg_id}, skipping")
+    #     return 
+    # redis_db.setex(f"p:{msg_id}", 90, "1")
     
-    # 提交到背景處理隊列
-    thread_pool.submit(process_in_background, user_id, user_msg, reply_token)
+    # # 提交到背景處理隊列
+    # thread_pool.submit(process_in_background, user_id, user_msg, reply_token)
+    
+    # 使用原子鎖：如果 key 已存在，則 nx=True 會回傳 None
+    # 將過期時間設長一點（例如 180 秒），確保 LINE 的所有重試週期都結束
+    is_new = redis_db.set(f"p:{msg_id}", "1", ex=180, nx=True)
+    
+    if not is_new:
+        print(f"⚠️  Detected retry for {msg_id}, dropped.")
+        return 
+
+    # 提交到 ThreadPool
+    thread_pool.submit(process_in_background, user_id, event.message.text, reply_token)
     return
     
 
