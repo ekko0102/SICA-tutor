@@ -70,7 +70,7 @@ REDIS_MAX_PER_STUDENT = 80
 # =============================================
 
 # 全域執行緒池（控制最大並發數）
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=40)
 
 def process_in_background(user_id, text, reply_token=None):
     """背景處理訊息的函數"""
@@ -78,11 +78,11 @@ def process_in_background(user_id, text, reply_token=None):
         print(f"🤖 Background processing for {user_id[:8]}")
         
         # 1. 啟動載入動畫
-        # try:
-        #     send_loading(user_id, loading_seconds=30)
-        #     print(f"▶️ Loading animation started for {user_id[:8]}")
-        # except Exception as e:
-        #     print(f"⚠️ Loading failed: {e}")
+        try:
+            send_loading(user_id, loading_seconds=60)
+            print(f"▶️ Loading animation started for {user_id[:8]}")
+        except Exception as e:
+            print(f"⚠️ Loading failed: {e}")
         
         # # 2. 立即回覆確認（如果 reply_token 還有效）
         # if reply_token:
@@ -445,26 +445,13 @@ def handle_message(event):
     if redis_db.get(f"p:{msg_id}"):
         print(f"⚠️  Duplicate message {msg_id}, skipping")
         return 
-    
-    redis_db.setex(f"p:{msg_id}", 20, "1")
-
-    # 群組過濾
-    if event.source.type == 'group':
-        if 'bot' not in user_msg.lower() and '@AI' not in user_msg:
-            redis_db.delete(f"p:{msg_id}")
-            return
-    
-    # 立即撥放動畫
-    try:
-        send_loading(user_id)
-        print(f"▶️ Started loading animation for {user_id}")
-    except Exception as e:
-        print(f"⚠️  Failed to start loading: {e}")
+    redis_db.setex(f"p:{msg_id}", 90, "1")
     
     # 提交到背景處理隊列
     thread_pool.submit(process_in_background, user_id, user_msg, reply_token)
+    return
     
-    print(f"✅ Message submitted to thread pool for {user_id[:8]}")
+
 # =============================================
 # 測試端點
 # =============================================
