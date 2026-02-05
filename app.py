@@ -70,7 +70,7 @@ REDIS_MAX_PER_STUDENT = 80
 # =============================================
 
 # 全域執行緒池（控制最大並發數）
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 def process_in_background(user_id, text, reply_token=None):
     """背景處理訊息的函數"""
