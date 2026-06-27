@@ -751,15 +751,15 @@ def export_conversations():
     
     try:
         all_data = []
-        cursor = '0'
-        
+        cursor = 0
+
         while True:
-            cursor, keys = redis_db.scan(cursor, match="h:*", count=30)
-            
+            cursor, keys = redis_db.scan(cursor, match="h:*", count=100)
+
             for key in keys:
                 student_id = key.split(":")[1]
                 messages = redis_db.lrange(key, 0, -1)
-                
+
                 student_msgs = []
                 for msg_json in messages:
                     try:
@@ -772,23 +772,23 @@ def export_conversations():
                         })
                     except:
                         continue
-                
+
                 if student_msgs:
                     all_data.append({
                         "student_id": student_id,
                         "total_messages": len(student_msgs),
-                        "messages": student_msgs[:50]
+                        "messages": student_msgs
                     })
-            
-            if cursor == '0':
+
+            if cursor == 0:
                 break
-        
+
         return jsonify({
             "export_time": datetime.now().isoformat(),
             "total_students": len(all_data),
             "data": all_data
         }), 200
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 # =============================================
@@ -872,15 +872,15 @@ def export_conversations_from_redis():
     """從 Redis 匯出對話紀錄"""
     try:
         all_data = []
-        cursor = '0'
-        
+        cursor = 0
+
         while True:
-            cursor, keys = redis_db.scan(cursor, match="h:*", count=30)
-            
+            cursor, keys = redis_db.scan(cursor, match="h:*", count=100)
+
             for key in keys:
                 student_id = key.split(":")[1]
                 messages = redis_db.lrange(key, 0, -1)
-                
+
                 student_msgs = []
                 for msg_json in messages:
                     try:
@@ -893,24 +893,24 @@ def export_conversations_from_redis():
                         })
                     except:
                         continue
-                
+
                 if student_msgs:
                     all_data.append({
                         "student_id": student_id,
                         "total_messages": len(student_msgs),
-                        "messages": student_msgs[:100]  # 限制每個使用者最多100條
+                        "messages": student_msgs
                     })
-            
-            if cursor == '0':
+
+            if cursor == 0:
                 break
-        
+
         return jsonify({
             "export_time": datetime.now().isoformat(),
             "total_students": len(all_data),
             "data": all_data,
             "note": "This is Redis-stored data"
         }), 200
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
