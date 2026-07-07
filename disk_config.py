@@ -201,7 +201,7 @@ class DiskStorage:
                     if conversations:
                         all_data[user_id] = {
                             "total_messages": len(conversations),
-                            "conversations": conversations[-200:]  # 最後200條
+                            "conversations": conversations  # 最後200條
                         }
             
             return all_data
